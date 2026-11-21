@@ -1,7 +1,7 @@
 import asyncio
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from recallengine import db
@@ -20,7 +20,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="RecallEngine",
     description="Semantic knowledge retrieval backend powered by PostgreSQL pgvector.",
-    version="0.2.0",
+    version="1.0.0",
     lifespan=lifespan,
 )
 
@@ -36,12 +36,12 @@ class SearchQuery(BaseModel):
     min_similarity: float = Field(default=0.35, ge=0.0, le=1.0)
 
 
-@app.post("/documents", status_code=201)
-async def create_document(payload: DocumentCreate):
+async def _ingest_document(title: str, content: str) -> dict:
+    """Chunk text, compute batch embeddings, and persist atomically."""
     if db.pool is None:
         raise HTTPException(status_code=503, detail="Database not initialized")
 
-    chunks = chunk_text(payload.content, chunk_size=150, overlap=30)
+    chunks = chunk_text(content, chunk_size=150, overlap=30)
     if not chunks:
         raise HTTPException(status_code=400, detail="Document content cannot be blank")
 
@@ -55,7 +55,7 @@ async def create_document(payload: DocumentCreate):
                 VALUES ($1)
                 RETURNING id, created_at;
                 """,
-                payload.title,
+                title,
             )
             doc_id = doc_row["id"]
 
@@ -73,9 +73,57 @@ async def create_document(payload: DocumentCreate):
 
     return {
         "document_id": doc_id,
-        "title": payload.title,
+        "title": title,
         "chunks_created": len(chunks),
         "created_at": doc_row["created_at"],
+    }
+
+
+@app.post("/documents", status_code=201)
+async def create_document(payload: DocumentCreate):
+    return await _ingest_document(payload.title, payload.content)
+
+
+@app.get("/documents")
+async def list_documents(
+    limit: int = Query(default=10, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+):
+    if db.pool is None:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+
+    async with db.pool.acquire() as conn:
+        total = await conn.fetchval("SELECT COUNT(*) FROM documents;")
+        rows = await conn.fetch(
+            """
+            SELECT
+                d.id,
+                d.title,
+                d.created_at,
+                COUNT(c.id) AS chunk_count
+            FROM documents d
+            LEFT JOIN chunks c ON c.document_id = d.id
+            GROUP BY d.id
+            ORDER BY d.created_at DESC, d.id DESC
+            LIMIT $1 OFFSET $2;
+            """,
+            limit,
+            offset,
+        )
+
+    return {
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "items": [
+            {
+                "id": r["id"],
+                "title": r["title"],
+                "chunk_count": r["chunk_count"],
+                "created_at": r["created_at"],
+            }
+            for r in rows
+        ],
     }
 
 
