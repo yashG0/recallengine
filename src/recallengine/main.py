@@ -47,30 +47,28 @@ async def _ingest_document(title: str, content: str) -> dict:
 
     vectors = await asyncio.to_thread(embed_texts, chunks)
 
-    async with db.pool.acquire() as conn:
-        async with conn.transaction():
-            doc_row = await conn.fetchrow(
-                """
+    async with db.pool.acquire() as conn, conn.transaction():
+        doc_row = await conn.fetchrow(
+            """
                 INSERT INTO documents (title)
                 VALUES ($1)
                 RETURNING id, created_at;
                 """,
-                title,
-            )
-            doc_id = doc_row["id"]
+            title,
+        )
+        doc_id = doc_row["id"]
 
-            records = [
-                (doc_id, idx, chunk_text_item, vec)
-                for idx, (chunk_text_item, vec) in enumerate(zip(chunks, vectors))
-            ]
-            await conn.executemany(
-                """
-                INSERT INTO chunks (document_id, chunk_index, content, embedding)
-                VALUES ($1, $2, $3, $4);
-                """,
-                records,
-            )
-
+        records = [
+            (doc_id, idx, chunk_text_item, vec)
+            for idx, (chunk_text_item, vec) in enumerate(zip(chunks, vectors))
+        ]
+    await conn.executemany(
+        """
+        INSERT INTO chunks (document_id, chunk_index, content, embedding)
+        VALUES ($1, $2, $3, $4);
+        """,
+        records,
+    )
     return {
         "document_id": doc_id,
         "title": title,
