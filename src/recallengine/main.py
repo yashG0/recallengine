@@ -1,12 +1,16 @@
 import asyncio
 from contextlib import asynccontextmanager
+from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
 
 from recallengine import db
 from recallengine.chunker import chunk_text
 from recallengine.embedder import embed_text, embed_texts, load_model
+
+ALLOWED_EXTENSIONS = {".txt", ".md"}
+MAX_UPLOAD_BYTES = 500 * 1024  # 500 KB
 
 
 @asynccontextmanager
@@ -47,28 +51,30 @@ async def _ingest_document(title: str, content: str) -> dict:
 
     vectors = await asyncio.to_thread(embed_texts, chunks)
 
-    async with db.pool.acquire() as conn, conn.transaction():
-        doc_row = await conn.fetchrow(
-            """
+    async with db.pool.acquire() as conn:  # noqa: SIM117
+        async with conn.transaction():
+            doc_row = await conn.fetchrow(
+                """
                 INSERT INTO documents (title)
                 VALUES ($1)
                 RETURNING id, created_at;
                 """,
-            title,
-        )
-        doc_id = doc_row["id"]
+                title,
+            )
+            doc_id = doc_row["id"]
 
-        records = [
-            (doc_id, idx, chunk_text_item, vec)
-            for idx, (chunk_text_item, vec) in enumerate(zip(chunks, vectors))
-        ]
-    await conn.executemany(
-        """
-        INSERT INTO chunks (document_id, chunk_index, content, embedding)
-        VALUES ($1, $2, $3, $4);
-        """,
-        records,
-    )
+            records = [
+                (doc_id, idx, chunk_text_item, vec)
+                for idx, (chunk_text_item, vec) in enumerate(zip(chunks, vectors))
+            ]
+            await conn.executemany(
+                """
+                INSERT INTO chunks (document_id, chunk_index, content, embedding)
+                VALUES ($1, $2, $3, $4);
+                """,
+                records,
+            )
+
     return {
         "document_id": doc_id,
         "title": title,
@@ -80,6 +86,45 @@ async def _ingest_document(title: str, content: str) -> dict:
 @app.post("/documents", status_code=201)
 async def create_document(payload: DocumentCreate):
     return await _ingest_document(payload.title, payload.content)
+
+
+@app.post("/documents/upload", status_code=201)
+async def upload_document(file: UploadFile):
+    if not file.filename:
+        raise HTTPException(
+            status_code=400, detail="Uploaded file must have a filename"
+        )
+
+    suffix = Path(file.filename).suffix.lower()
+    if suffix not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type '{suffix}'. Allowed types: .txt, .md",
+        )
+
+    raw_bytes = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(raw_bytes) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File exceeds maximum allowed size of {MAX_UPLOAD_BYTES // 1024} KB",
+        )
+
+    try:
+        content = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="File must be valid UTF-8 encoded text",
+        ) from exc
+
+    if len(content.strip()) < 10:
+        raise HTTPException(
+            status_code=400,
+            detail="Uploaded file must contain at least 10 characters of text",
+        )
+
+    title = Path(file.filename).stem
+    return await _ingest_document(title=title, content=content)
 
 
 @app.get("/documents")
